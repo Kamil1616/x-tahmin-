@@ -18,15 +18,16 @@ def search_teams(query):
     try:
         resp = requests.get(f"{BASE_URL}/search/teams?q={query}", headers=HEADERS, timeout=8)
         if resp.status_code == 200:
-            return resp.json().get("results", [])[:6]
+            return resp.json().get("results", [])[:8]  # daha fazla öneri için 8
         return []
-    except:
+    except Exception as e:
+        st.error(f"Arama hatası: {e}")
         return []
 
 @st.cache_data(ttl=900)
 def get_last_matches(team_id):
     try:
-        resp = requests.get(f"{BASE_URL}/team/{team_id}/events/last/0", headers=HEADERS, timeout=12)
+        resp = requests.get(f"{BASE_URL}/team/{team_id}/events/last/0", headers=HEADERS, timeout=15)
         if resp.status_code != 200:
             return []
         events = resp.json().get("events", [])
@@ -45,16 +46,15 @@ def get_last_matches(team_id):
                 "goals_conceded": sa if is_home else sh,
                 "result": 1 if (sh > sa and is_home) or (sa > sh and not is_home) else 0 if sh == sa else -1
             })
-        return matches  # timestamp yoktu, sıralamayı kaldırdık (son maçlar zaten son sıralı gelir)
-    except:
+        return matches
+    except Exception as e:
+        st.error(f"Maç çekme hatası: {e}")
         return []
 
 def analyze(matches, home_only=False, away_only=False, n=6):
-    filtered = matches
-    if home_only:
-        filtered = [m for m in matches if m["is_home"]]
-    elif away_only:
-        filtered = [m for m in matches if not m["is_home"]]
+    if not matches:
+        return None
+    filtered = [m for m in matches if (home_only and m["is_home"]) or (away_only and not m["is_home"]) or (not home_only and not away_only)]
     recent = filtered[:n]
     if len(recent) < 3:
         return None
@@ -65,11 +65,11 @@ def analyze(matches, home_only=False, away_only=False, n=6):
 def predict(h_stats, a_stats):
     if not h_stats or not a_stats:
         return None
-    lh = (h_stats["scored"] * 1.1 + a_stats["conceded"] * 0.9) / 2
+    lh = (h_stats["scored"] * 1.1 + a_stats["conceded"] * 0.9) / 2   # ev avantajı hafif artır
     la = (a_stats["scored"] * 0.9 + h_stats["conceded"] * 1.1) / 2
-    probs = {"1":0, "X":0, "2":0, "over_0.5":0, "over_1.5":0, "over_2.5":0, "over_3.5":0}
-    for i in range(8):
-        for j in range(8):
+    probs = {"1": 0, "X": 0, "2": 0, "over_0.5": 0, "over_1.5": 0, "over_2.5": 0, "over_3.5": 0}
+    for i in range(9):
+        for j in range(9):
             p = poisson.pmf(i, lh) * poisson.pmf(j, la)
             if i > j: probs["1"] += p
             elif i == j: probs["X"] += p
@@ -79,62 +79,65 @@ def predict(h_stats, a_stats):
             if tg > 1.5: probs["over_1.5"] += p
             if tg > 2.5: probs["over_2.5"] += p
             if tg > 3.5: probs["over_3.5"] += p
-    odds = {k: round(1 / v * 1.08, 2) if v > 0.02 else "—" for k, v in probs.items()}
+    odds = {k: round(1 / v * 1.08, 2) if v > 0.015 else "—" for k, v in probs.items()}
     return {
         "probs": {k: f"{v*100:.1f}%" for k, v in probs.items()},
         "odds": odds,
         "xg": f"{lh:.2f} – {la:.2f}"
     }
 
-st.title("Maç Tahmin Aracı – Son 6 Maç")
+st.title("Futbol Maç Tahmin – Son 6 Maç İstatistiği")
+
+st.markdown("Takım isimlerini yaz (örn: galatasaray, fenerbahce, besiktas, mancity)")
 
 col1, col2 = st.columns(2)
 
 with col1:
-    home_q = st.text_input("Ev sahibi takım ara", key="home_input")
+    home_q = st.text_input("Ev Sahibi Ara", key="home_q")
     home_res = search_teams(home_q)
-    home_options = [t.get("name", "Bilinmeyen Takım") for t in home_res]
-    home_sel = st.selectbox("Ev sahibi seç", options=home_options if home_options else ["Takım ara..."], key="home_sel")
+    home_options = [t["entity"]["name"] for t in home_res if "entity" in t and "name" in t["entity"]] or ["Sonuç yok"]
+    home_sel = st.selectbox("Ev Sahibi Seç", home_options, key="home_sel")
 
 with col2:
-    away_q = st.text_input("Deplasman takım ara", key="away_input")
+    away_q = st.text_input("Deplasman Ara", key="away_q")
     away_res = search_teams(away_q)
-    away_options = [t.get("name", "Bilinmeyen Takım") for t in away_res]
-    away_sel = st.selectbox("Deplasman seç", options=away_options if away_options else ["Takım ara..."], key="away_sel")
+    away_options = [t["entity"]["name"] for t in away_res if "entity" in t and "name" in t["entity"]] or ["Sonuç yok"]
+    away_sel = st.selectbox("Deplasman Seç", away_options, key="away_sel")
 
-if st.button("Tahmin Yap"):
-    if home_sel in ["Takım ara...", "Bilinmeyen Takım"] or away_sel in ["Takım ara...", "Bilinmeyen Takım"]:
-        st.warning("Lütfen iki geçerli takımı seçin.")
+if st.button("Tahmin Yap", type="primary"):
+    if home_sel == "Sonuç yok" or away_sel == "Sonuç yok":
+        st.warning("Takımları doğru aratıp seçin.")
     else:
-        # Seçilen isme göre takım objesini bul
-        home_t = next((t for t in home_res if t.get("name") == home_sel), None)
-        away_t = next((t for t in away_res if t.get("name") == away_sel), None)
+        home_entity = next((t["entity"] for t in home_res if t["entity"].get("name") == home_sel), None)
+        away_entity = next((t["entity"] for t in away_res if t["entity"].get("name") == away_sel), None)
         
-        if home_t is None or away_t is None:
-            st.error("Seçilen takımın bilgileri alınamadı. Tekrar aratmayı deneyin.")
+        if not home_entity or not away_entity:
+            st.error("Takım ID alınamadı.")
         else:
-            with st.spinner("Maç verileri çekiliyor..."):
-                h_matches = get_last_matches(home_t["id"])
-                a_matches = get_last_matches(away_t["id"])
-                
-                h_home_stats = analyze(h_matches, home_only=True) or analyze(h_matches)
-                a_away_stats = analyze(a_matches, away_only=True) or analyze(a_matches)
-                
-                if h_home_stats is None or a_away_stats is None:
-                    st.warning("Yeterli maç verisi yok.")
-                else:
-                    pred = predict(h_home_stats, a_away_stats)
-                    if pred:
-                        st.success("Tahmin hazır!")
-                        st.write(f"**Beklenen gol (xG)**: {pred['xg']}")
-                        
+            h_matches = get_last_matches(home_entity["id"])
+            a_matches = get_last_matches(away_entity["id"])
+            
+            h_stats = analyze(h_matches, home_only=True) or analyze(h_matches)
+            a_stats = analyze(a_matches, away_only=True) or analyze(a_matches)
+            
+            if not h_stats or not a_stats:
+                st.warning("Yeterli maç verisi yok (en az 3 maç gerekli).")
+            else:
+                pred = predict(h_stats, a_stats)
+                if pred:
+                    st.success("Tahmin Hazır!")
+                    st.write(f"**Beklenen Gol (xG)**: {pred['xg']}")
+                    
+                    col_ms, col_ua = st.columns(2)
+                    with col_ms:
                         st.subheader("Maç Sonucu")
-                        for res in ["1", "X", "2"]:
-                            st.write(f"**{res}**: {pred['probs'][res]} → oran ≈ {pred['odds'][res]}")
-                        
+                        for r in ["1", "X", "2"]:
+                            st.write(f"**{r}**: {pred['probs'][r]} → oran ≈ {pred['odds'][r]}")
+                    
+                    with col_ua:
                         st.subheader("Üst / Alt")
                         for ov in ["over_0.5", "over_1.5", "over_2.5", "over_3.5"]:
-                            label = ov.replace("over_", "Üst ").replace("_", ".")
-                            st.write(f"**{label}**: {pred['probs'][ov]} → oran ≈ {pred['odds'][ov]}")
-                    else:
-                        st.error("Tahmin hesaplanamadı.")
+                            lbl = ov.replace("over_", "Üst ").replace("_", ".")
+                            st.write(f"**{lbl}**: {pred['probs'][ov]} → oran ≈ {pred['odds'][ov]}")
+                else:
+                    st.error("Tahmin hesaplanamadı.")
